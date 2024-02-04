@@ -3,7 +3,7 @@ package datastorer
 import (
 	"context"
 	"fmt"
-	"inventory/model"
+	"github.com/mkruczek/datastorer/inventory"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -14,18 +14,18 @@ const delay = 5 * time.Second
 var limit = 1000
 
 type headerRepo interface {
-	CreateInventoryHeader(userID string, plantCode string, rackTypes []string, inventoryType string) (model.Header, error)
+	CreateInventoryHeader(userID string, warehouseID string, productType []string, inventoryType string) (inventory.Header, error)
 }
 
 type detailRepo interface {
-	CreateInventoryDetailInBach(data []model.Detail) error
+	CreateInventoryDetailInBach(data []inventory.Detail) error
 }
 
 // globalServer - interface for global microservice where we have some data
 type globalServer interface {
 	InitSnapshot(ctx context.Context, predicate predicate) error
 	SnapshotIsReady(ctx context.Context, predicate predicate) (bool, error)
-	GetSnapshotData(ctx context.Context, predicate predicate, offset, limit int) ([]model.Snapshot, error)
+	GetSnapshotData(ctx context.Context, predicate predicate, offset, limit int) ([]inventory.Snapshot, error)
 }
 
 type reportGenerator interface {
@@ -40,7 +40,7 @@ type Manager struct {
 	report reportGenerator
 
 	snapshotReady      chan bool
-	snapshotData       chan []model.Snapshot
+	snapshotData       chan []inventory.Snapshot
 	dataReadyForReport chan bool
 
 	snapshotError chan error
@@ -68,7 +68,7 @@ func (s *Manager) Process(ctx context.Context, userID, warehouseID, lang string,
 
 	//open/reopen channel if it was closed
 	s.snapshotReady = make(chan bool)
-	s.snapshotData = make(chan []model.Snapshot)
+	s.snapshotData = make(chan []inventory.Snapshot)
 	s.dataReadyForReport = make(chan bool)
 	s.snapshotError = make(chan error)
 
@@ -91,7 +91,7 @@ func (s *Manager) Process(ctx context.Context, userID, warehouseID, lang string,
 
 	go s.saveSnapshotToDetailsDB(ctx, header)
 
-	go s.generateReport(header.InventoryNumber, lang)
+	go s.prepareReport(ctx, header.InventoryNumber, lang)
 
 	return header.InventoryNumber, nil
 }
@@ -109,31 +109,13 @@ func (s *Manager) errorMonitor(ctx context.Context, cancel context.CancelFunc) {
 			}
 			cancel()
 			log.Errorf("Snapshot creation procces end with error: %s", err)
-
-			//close channels if error occurred, but first check if they are not closed already
-			if _, ok := <-s.snapshotReady; ok {
-				close(s.snapshotReady)
-			}
-
-			if _, ok := <-s.snapshotData; ok {
-				close(s.snapshotData)
-			}
-
-			if _, ok := <-s.dataReadyForReport; ok {
-				close(s.dataReadyForReport)
-			}
-
-			if _, ok := <-s.snapshotError; ok {
-				close(s.snapshotError)
-			}
-
 			return
 		}
 	}
 }
 
 // initializeRackInventorySnapshotFromGlobalService - make call to global to  initialize snapshot from main product table.
-func (s *Manager) initializeRackInventorySnapshotFromGlobalService(ctx context.Context, header model.Header) error {
+func (s *Manager) initializeRackInventorySnapshotFromGlobalService(ctx context.Context, header inventory.Header) error {
 
 	inventoryPredicate := predicate{
 		WarehouseID:     header.WarehouseID,
@@ -146,7 +128,7 @@ func (s *Manager) initializeRackInventorySnapshotFromGlobalService(ctx context.C
 }
 
 // function will be calling global microservice to checking if snapshot is ready
-func (s *Manager) monitoringSnapshotProcess(ctx context.Context, header model.Header) {
+func (s *Manager) monitoringSnapshotProcess(ctx context.Context, header inventory.Header) {
 
 	defer close(s.snapshotReady)
 
@@ -179,9 +161,8 @@ func (s *Manager) monitoringSnapshotProcess(ctx context.Context, header model.He
 	}
 }
 
-func (s *Manager) pullDataInBatch(ctx context.Context, header model.Header) {
+func (s *Manager) pullDataInBatch(ctx context.Context, header inventory.Header) {
 
-	<-s.snapshotReady
 	defer close(s.snapshotData)
 
 	inventoryPredicate := predicate{
@@ -196,8 +177,7 @@ func (s *Manager) pullDataInBatch(ctx context.Context, header model.Header) {
 		case <-ctx.Done():
 			log.Infof("Context cancelled, exiting pullDataInBatch")
 			return
-		default:
-
+		case <-s.snapshotReady:
 			data, err := s.global.GetSnapshotData(ctx, inventoryPredicate, offset, limit)
 			if err != nil {
 				s.snapshotError <- err
@@ -218,9 +198,14 @@ func (s *Manager) pullDataInBatch(ctx context.Context, header model.Header) {
 	}
 }
 
-func (s *Manager) saveSnapshotToDetailsDB(ctx context.Context, header model.Header) {
+func (s *Manager) saveSnapshotToDetailsDB(ctx context.Context, header inventory.Header) {
 
 	defer close(s.dataReadyForReport)
+
+	//hasDataToSave is used to check if we have any data at local/facade details database
+	//variable is used to send message via channel to prepare report
+	//where we check if we have data(true) to save and we can prepare report or not(false)
+	hasDataToSave := false
 
 	for {
 		select {
@@ -228,15 +213,20 @@ func (s *Manager) saveSnapshotToDetailsDB(ctx context.Context, header model.Head
 			log.Infof("Context cancelled, exiting saveSnapshotToDetailsDB")
 			return
 		case data, ok := <-s.snapshotData:
+			log.Infof("TUTAJ_7: ok " + fmt.Sprint(ok) + " data: " + fmt.Sprint(data))
+			log.Infof("TUTAJ_7: hasDataToSave " + fmt.Sprint(hasDataToSave))
 			if !ok {
 				log.Infof("No more data to save for inventory document number %s", header.InventoryNumber)
-				s.dataReadyForReport <- true
-				return
+				select {
+				case s.dataReadyForReport <- hasDataToSave:
+				default:
+					return
+				}
 			}
 
-			dataToSave := make([]model.Detail, len(data))
+			dataToSave := make([]inventory.Detail, len(data))
 			for i, v := range data {
-				dataToSave[i] = model.Detail{
+				dataToSave[i] = inventory.Detail{
 					HeaderID:        header.ID,
 					InventoryNumber: v.InventoryNumber,
 					//...
@@ -244,21 +234,39 @@ func (s *Manager) saveSnapshotToDetailsDB(ctx context.Context, header model.Head
 			}
 
 			if err := s.detail.CreateInventoryDetailInBach(dataToSave); err != nil {
+				log.Infof("TUTAJ_8")
 				s.snapshotError <- err
 				return
 			}
+
+			hasDataToSave = true
 		}
 	}
 }
 
-func (s *Manager) generateReport(inventoryNumber string, lang string) {
+func (s *Manager) prepareReport(ctx context.Context, inventoryNumber string, lang string) {
 
-	<-s.dataReadyForReport
 	defer close(s.snapshotError)
 
-	err := s.report.Generate(inventoryNumber, lang)
-	if err != nil {
-		s.snapshotError <- err
-		return
+	for {
+		select {
+		case <-ctx.Done():
+			log.Infof("Context cancelled, exiting prepareReport")
+			return
+		case hasData, ok := <-s.dataReadyForReport:
+			log.Infof("TUTAJ_9: hasData " + fmt.Sprint(hasData) + " ok: " + fmt.Sprint(ok))
+			if !hasData || !ok {
+				log.Infof("No data to prepare report for inventory document number %s", inventoryNumber)
+				return
+			}
+
+			err := s.report.Generate(inventoryNumber, lang)
+			if err != nil {
+				s.snapshotError <- err
+			}
+
+			return
+		}
 	}
+
 }

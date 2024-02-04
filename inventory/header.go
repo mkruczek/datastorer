@@ -1,10 +1,11 @@
-package model
+package inventory
 
 import "github.com/google/uuid"
 
-type Detail struct {
+type Header struct {
 	ID              uuid.UUID
-	HeaderID        uuid.UUID
 	InventoryNumber string
+	WarehouseID     string
+	InventoryType   string
 	//...
 }
