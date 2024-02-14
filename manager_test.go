@@ -114,7 +114,7 @@ func TestManager_Process_EndWithError(t *testing.T) {
 	mGlobalConnector.On("InitSnapshot", mock.Anything, mock.Anything).Return(nil)
 	mGlobalConnector.On("SnapshotIsReady", mock.Anything, mock.Anything).Return(true, nil)
 
-	//force error and we expect that context will be cancelled and that all channels will be closed
+	//force error, and we expect that context will be cancelled and that all channels will be closed
 	mGlobalConnector.On("GetSnapshotData", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]inventory.Snapshot{}, fmt.Errorf("test error"))
 
 	_, err := manager.Process(context.Background(), "U100", plantCode, "en", []string{"RT100"}, "all")
